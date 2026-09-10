@@ -1,9 +1,12 @@
 #include <cmath>
 #include <cstdio>
 #include <cstdlib>
+#include <cstring>
 #include <random>
+#include <string>
 #include <vector>
 
+#include "report.h"
 #include "simulation.h"
 #include "vk_context.h"
 
@@ -160,9 +163,90 @@ bool timestampCase(VulkanContext& ctx, uint32_t n, uint32_t warmup, uint32_t see
     return ok;
 }
 
+// --- Phase 5: profiling run + report ---
+int runReport(VulkanContext& ctx, uint32_t particles, uint32_t steps, uint32_t warmup,
+              const std::string& csvPath) {
+    SimParams params;
+    params.particleCount = particles;
+
+    auto initial = makeParticles(particles, /*seed=*/1);
+    const Vec3 p0 = totalMomentum(initial);
+
+    Simulation sim;
+    sim.init(ctx, params, initial);
+
+    for (uint32_t i = 0; i < warmup; ++i) sim.stepOnce();
+
+    Report report;
+    for (uint32_t i = 0; i < steps; ++i) {
+        sim.stepOnce();
+        report.addSample(sim.lastTimings());
+    }
+
+    auto finalState = sim.readParticles();
+    sim.destroy();
+
+    char header[256];
+    std::snprintf(header, sizeof(header), "Per-stage timing  N=%u  device=%s", particles,
+                  ctx.deviceSummary().c_str());
+    report.printTable(stdout, header);
+
+    float drift = length(sub(totalMomentum(finalState), p0));
+    std::printf("\ncorrectness: momentum drift after %u steps = %.3e (rel %.3e)\n", steps,
+                drift, drift / (length(p0) + 1e-4f));
+
+    if (!csvPath.empty()) {
+        std::FILE* f = std::fopen(csvPath.c_str(), "w");
+        if (!f) {
+            std::fprintf(stderr, "error: cannot open %s for writing\n", csvPath.c_str());
+            return EXIT_FAILURE;
+        }
+        report.writeCsv(f);
+        std::fclose(f);
+        std::printf("wrote per-step CSV: %s (%zu rows)\n", csvPath.c_str(),
+                    report.sampleCount());
+    }
+    return EXIT_SUCCESS;
+}
+
 }  // namespace
 
-int main() {
+int main(int argc, char** argv) {
+    bool reportMode = false;
+    uint32_t particles = 8192, steps = 200, warmup = 10;
+    std::string csvPath;
+    for (int i = 1; i < argc; ++i) {
+        std::string a = argv[i];
+        auto next = [&]() -> const char* {
+            if (i + 1 >= argc) {
+                std::fprintf(stderr, "error: %s needs a value\n", a.c_str());
+                std::exit(EXIT_FAILURE);
+            }
+            return argv[++i];
+        };
+        if (a == "--report")
+            reportMode = true;
+        else if (a == "--particles")
+            particles = static_cast<uint32_t>(std::strtoul(next(), nullptr, 10));
+        else if (a == "--steps")
+            steps = static_cast<uint32_t>(std::strtoul(next(), nullptr, 10));
+        else if (a == "--warmup")
+            warmup = static_cast<uint32_t>(std::strtoul(next(), nullptr, 10));
+        else if (a == "--csv")
+            csvPath = next();
+        else if (a == "--help" || a == "-h") {
+            std::printf(
+                "usage: profiler [--report] [--particles N] [--steps S] [--warmup W]\n"
+                "                [--csv PATH]\n"
+                "  no args : run correctness self-tests (phases 2-4)\n"
+                "  --report: run the sim and print a per-stage timing breakdown\n");
+            return EXIT_SUCCESS;
+        } else {
+            std::fprintf(stderr, "error: unknown argument '%s' (try --help)\n", a.c_str());
+            return EXIT_FAILURE;
+        }
+    }
+
     VulkanContext ctx;
     try {
         ctx.create(/*enableValidation=*/true);
@@ -173,6 +257,19 @@ int main() {
 
     std::printf("Device: %s\n", ctx.deviceSummary().c_str());
     std::printf("Validation: %s\n", ctx.validationEnabled ? "enabled" : "disabled");
+
+    if (reportMode) {
+        int rc;
+        try {
+            rc = runReport(ctx, particles, steps, warmup, csvPath);
+        } catch (const std::exception& e) {
+            std::fprintf(stderr, "fatal: %s\n", e.what());
+            ctx.destroy();
+            return EXIT_FAILURE;
+        }
+        ctx.destroy();
+        return rc;
+    }
 
     int failures = 0;
     try {

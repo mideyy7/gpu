@@ -38,6 +38,7 @@ add_executable(profiler
     src/main.cpp
     src/vk_context.cpp
     src/simulation.cpp
+    src/report.cpp
 )
 add_dependencies(profiler shaders)
 target_link_libraries(profiler PRIVATE Vulkan::Vulkan)
