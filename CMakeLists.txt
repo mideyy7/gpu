@@ -34,7 +34,11 @@ endforeach()
 
 add_custom_target(shaders ALL DEPENDS ${SPIRV_BINARIES})
 
-add_executable(profiler src/main.cpp)
+add_executable(profiler
+    src/main.cpp
+    src/vk_context.cpp
+    src/simulation.cpp
+)
 add_dependencies(profiler shaders)
 target_link_libraries(profiler PRIVATE Vulkan::Vulkan)
 target_compile_definitions(profiler PRIVATE SHADER_DIR="${SHADER_OUT_DIR}")

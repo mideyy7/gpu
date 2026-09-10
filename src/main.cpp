@@ -1,197 +1,112 @@
-#include <vulkan/vulkan.h>
-
+#include <cmath>
 #include <cstdio>
 #include <cstdlib>
-#include <cstring>
-#include <optional>
+#include <random>
 #include <vector>
 
-#ifdef NDEBUG
-static constexpr bool kEnableValidation = false;
-#else
-static constexpr bool kEnableValidation = true;
-#endif
+#include "simulation.h"
+#include "vk_context.h"
 
-static VKAPI_ATTR VkBool32 VKAPI_CALL debugCallback(
-    VkDebugUtilsMessageSeverityFlagBitsEXT severity,
-    VkDebugUtilsMessageTypeFlagsEXT /*type*/,
-    const VkDebugUtilsMessengerCallbackDataEXT* data,
-    void* /*userData*/) {
-    if (severity >= VK_DEBUG_UTILS_MESSAGE_SEVERITY_WARNING_BIT_EXT) {
-        std::fprintf(stderr, "[validation] %s\n", data->pMessage);
+namespace {
+
+std::vector<Particle> makeParticles(uint32_t n, uint32_t seed) {
+    std::mt19937 rng(seed);
+    std::uniform_real_distribution<float> pos(-5.0f, 5.0f);
+    std::uniform_real_distribution<float> mass(0.5f, 2.0f);
+    std::uniform_real_distribution<float> vel(-1.0f, 1.0f);
+    std::vector<Particle> p(n);
+    for (auto& q : p) {
+        q.px = pos(rng);
+        q.py = pos(rng);
+        q.pz = pos(rng);
+        q.mass = mass(rng);
+        q.vx = vel(rng);
+        q.vy = vel(rng);
+        q.vz = vel(rng);
     }
-    return VK_FALSE;
+    return p;
 }
 
-static bool hasLayer(const char* name) {
-    uint32_t count = 0;
-    vkEnumerateInstanceLayerProperties(&count, nullptr);
-    std::vector<VkLayerProperties> layers(count);
-    vkEnumerateInstanceLayerProperties(&count, layers.data());
-    for (const auto& l : layers) {
-        if (std::strcmp(l.layerName, name) == 0) return true;
-    }
-    return false;
+// Relative error with an absolute floor, so near-zero components don't blow up.
+float relError(const Vec3& a, const Vec3& b) {
+    float num = std::sqrt((a.x - b.x) * (a.x - b.x) + (a.y - b.y) * (a.y - b.y) +
+                          (a.z - b.z) * (a.z - b.z));
+    float den = std::sqrt(b.x * b.x + b.y * b.y + b.z * b.z) + 1e-4f;
+    return num / den;
 }
 
-static bool hasInstanceExtension(const char* name) {
-    uint32_t count = 0;
-    vkEnumerateInstanceExtensionProperties(nullptr, &count, nullptr);
-    std::vector<VkExtensionProperties> exts(count);
-    vkEnumerateInstanceExtensionProperties(nullptr, &count, exts.data());
-    for (const auto& e : exts) {
-        if (std::strcmp(e.extensionName, name) == 0) return true;
+bool runCase(VulkanContext& ctx, uint32_t n, uint32_t seed, float tol) {
+    SimParams params;
+    params.particleCount = n;
+    params.gravity = 1.0f;
+    params.softening = 0.5f;
+
+    auto particles = makeParticles(n, seed);
+
+    Simulation sim;
+    sim.init(ctx, params, particles);
+    sim.runForceCalcOnce();
+    auto gpu = sim.readAccelerations();
+    sim.destroy();
+
+    auto cpu = cpuForceCalc(particles, params);
+
+    float worst = 0.0f;
+    int worstIdx = -1;
+    for (uint32_t i = 0; i < n; ++i) {
+        float e = relError(gpu[i], cpu[i]);
+        if (e > worst) {
+            worst = e;
+            worstIdx = static_cast<int>(i);
+        }
     }
-    return false;
+
+    bool ok = worst <= tol;
+    std::printf("  N=%-5u seed=%-3u  worst rel-err=%.3e @ i=%d  [%s]\n", n, seed, worst,
+                worstIdx, ok ? "PASS" : "FAIL");
+    if (!ok && worstIdx >= 0) {
+        const auto& g = gpu[worstIdx];
+        const auto& c = cpu[worstIdx];
+        std::printf("    gpu=(% .6f % .6f % .6f)\n    cpu=(% .6f % .6f % .6f)\n", g.x, g.y,
+                    g.z, c.x, c.y, c.z);
+    }
+    return ok;
 }
+
+}  // namespace
 
 int main() {
-    // --- Instance ---
-    VkApplicationInfo appInfo{};
-    appInfo.sType = VK_STRUCTURE_TYPE_APPLICATION_INFO;
-    appInfo.pApplicationName = "gpu-compute-profiler";
-    appInfo.apiVersion = VK_API_VERSION_1_2;
-
-    std::vector<const char*> instanceExtensions;
-    std::vector<const char*> instanceLayers;
-    VkInstanceCreateFlags instanceFlags = 0;
-
-    if (hasInstanceExtension(VK_KHR_PORTABILITY_ENUMERATION_EXTENSION_NAME)) {
-        instanceExtensions.push_back(VK_KHR_PORTABILITY_ENUMERATION_EXTENSION_NAME);
-        instanceFlags |= VK_INSTANCE_CREATE_ENUMERATE_PORTABILITY_BIT_KHR;
-    }
-
-    bool validationAvailable = kEnableValidation && hasLayer("VK_LAYER_KHRONOS_validation");
-    if (validationAvailable) {
-        instanceLayers.push_back("VK_LAYER_KHRONOS_validation");
-        instanceExtensions.push_back(VK_EXT_DEBUG_UTILS_EXTENSION_NAME);
-    } else if (kEnableValidation) {
-        std::fprintf(stderr,
-                     "warning: VK_LAYER_KHRONOS_validation not found, running without "
-                     "validation\n");
-    }
-
-    VkInstanceCreateInfo instInfo{};
-    instInfo.sType = VK_STRUCTURE_TYPE_INSTANCE_CREATE_INFO;
-    instInfo.pApplicationInfo = &appInfo;
-    instInfo.flags = instanceFlags;
-    instInfo.enabledExtensionCount = static_cast<uint32_t>(instanceExtensions.size());
-    instInfo.ppEnabledExtensionNames = instanceExtensions.data();
-    instInfo.enabledLayerCount = static_cast<uint32_t>(instanceLayers.size());
-    instInfo.ppEnabledLayerNames = instanceLayers.data();
-
-    VkInstance instance = VK_NULL_HANDLE;
-    if (vkCreateInstance(&instInfo, nullptr, &instance) != VK_SUCCESS) {
-        std::fprintf(stderr, "fatal: vkCreateInstance failed\n");
+    VulkanContext ctx;
+    try {
+        ctx.create(/*enableValidation=*/true);
+    } catch (const std::exception& e) {
+        std::fprintf(stderr, "fatal: %s\n", e.what());
         return EXIT_FAILURE;
     }
 
-    VkDebugUtilsMessengerEXT messenger = VK_NULL_HANDLE;
-    if (validationAvailable) {
-        auto createFn = reinterpret_cast<PFN_vkCreateDebugUtilsMessengerEXT>(
-            vkGetInstanceProcAddr(instance, "vkCreateDebugUtilsMessengerEXT"));
-        if (createFn) {
-            VkDebugUtilsMessengerCreateInfoEXT dbgInfo{};
-            dbgInfo.sType = VK_STRUCTURE_TYPE_DEBUG_UTILS_MESSENGER_CREATE_INFO_EXT;
-            dbgInfo.messageSeverity =
-                VK_DEBUG_UTILS_MESSAGE_SEVERITY_WARNING_BIT_EXT |
-                VK_DEBUG_UTILS_MESSAGE_SEVERITY_ERROR_BIT_EXT;
-            dbgInfo.messageType = VK_DEBUG_UTILS_MESSAGE_TYPE_GENERAL_BIT_EXT |
-                                   VK_DEBUG_UTILS_MESSAGE_TYPE_VALIDATION_BIT_EXT |
-                                   VK_DEBUG_UTILS_MESSAGE_TYPE_PERFORMANCE_BIT_EXT;
-            dbgInfo.pfnUserCallback = debugCallback;
-            createFn(instance, &dbgInfo, nullptr, &messenger);
-        }
-    }
+    std::printf("Device: %s\n", ctx.deviceSummary().c_str());
+    std::printf("Validation: %s\n\n", ctx.validationEnabled ? "enabled" : "disabled");
+    std::printf("Phase 2: force-calc GPU vs CPU reference\n");
 
-    // --- Physical device: pick first with a compute-capable queue family ---
-    uint32_t deviceCount = 0;
-    vkEnumeratePhysicalDevices(instance, &deviceCount, nullptr);
-    if (deviceCount == 0) {
-        std::fprintf(stderr, "fatal: no Vulkan physical devices found\n");
-        return EXIT_FAILURE;
-    }
-    std::vector<VkPhysicalDevice> physicalDevices(deviceCount);
-    vkEnumeratePhysicalDevices(instance, &deviceCount, physicalDevices.data());
+    const float tol = 2e-3f;  // GPU inversesqrt vs CPU 1/sqrt precision gap
+    struct Case {
+        uint32_t n, seed;
+    };
+    const Case cases[] = {{4, 1}, {8, 2}, {16, 3}, {13, 99}};
 
-    VkPhysicalDevice physicalDevice = VK_NULL_HANDLE;
-    uint32_t computeQueueFamily = 0;
-    for (auto pd : physicalDevices) {
-        uint32_t qCount = 0;
-        vkGetPhysicalDeviceQueueFamilyProperties(pd, &qCount, nullptr);
-        std::vector<VkQueueFamilyProperties> qProps(qCount);
-        vkGetPhysicalDeviceQueueFamilyProperties(pd, &qCount, qProps.data());
-        for (uint32_t i = 0; i < qCount; ++i) {
-            if (qProps[i].queueFlags & VK_QUEUE_COMPUTE_BIT) {
-                physicalDevice = pd;
-                computeQueueFamily = i;
-                break;
-            }
-        }
-        if (physicalDevice != VK_NULL_HANDLE) break;
-    }
-    if (physicalDevice == VK_NULL_HANDLE) {
-        std::fprintf(stderr, "fatal: no compute-capable queue family found\n");
+    int failures = 0;
+    try {
+        for (const auto& c : cases)
+            if (!runCase(ctx, c.n, c.seed, tol)) ++failures;
+    } catch (const std::exception& e) {
+        std::fprintf(stderr, "fatal: %s\n", e.what());
+        ctx.destroy();
         return EXIT_FAILURE;
     }
 
-    VkPhysicalDeviceProperties props{};
-    vkGetPhysicalDeviceProperties(physicalDevice, &props);
+    ctx.destroy();
 
-    // --- Logical device + compute queue ---
-    std::vector<const char*> deviceExtensions;
-    uint32_t devExtCount = 0;
-    vkEnumerateDeviceExtensionProperties(physicalDevice, nullptr, &devExtCount, nullptr);
-    std::vector<VkExtensionProperties> devExts(devExtCount);
-    vkEnumerateDeviceExtensionProperties(physicalDevice, nullptr, &devExtCount, devExts.data());
-    for (const auto& e : devExts) {
-        if (std::strcmp(e.extensionName, "VK_KHR_portability_subset") == 0) {
-            deviceExtensions.push_back("VK_KHR_portability_subset");
-        }
-    }
-
-    float queuePriority = 1.0f;
-    VkDeviceQueueCreateInfo queueInfo{};
-    queueInfo.sType = VK_STRUCTURE_TYPE_DEVICE_QUEUE_CREATE_INFO;
-    queueInfo.queueFamilyIndex = computeQueueFamily;
-    queueInfo.queueCount = 1;
-    queueInfo.pQueuePriorities = &queuePriority;
-
-    VkDeviceCreateInfo devInfo{};
-    devInfo.sType = VK_STRUCTURE_TYPE_DEVICE_CREATE_INFO;
-    devInfo.queueCreateInfoCount = 1;
-    devInfo.pQueueCreateInfos = &queueInfo;
-    devInfo.enabledExtensionCount = static_cast<uint32_t>(deviceExtensions.size());
-    devInfo.ppEnabledExtensionNames = deviceExtensions.data();
-
-    VkDevice device = VK_NULL_HANDLE;
-    if (vkCreateDevice(physicalDevice, &devInfo, nullptr, &device) != VK_SUCCESS) {
-        std::fprintf(stderr, "fatal: vkCreateDevice failed\n");
-        return EXIT_FAILURE;
-    }
-
-    VkQueue computeQueue = VK_NULL_HANDLE;
-    vkGetDeviceQueue(device, computeQueueFamily, 0, &computeQueue);
-
-    bool isTranslationLayer = std::strstr(props.deviceName, "MoltenVK") != nullptr ||
-                               props.vendorID == 0x106b;  // Apple vendor ID via MoltenVK
-    std::printf("Vulkan device: %s\n", props.deviceName);
-    std::printf("Driver version: %u.%u.%u\n", VK_VERSION_MAJOR(props.driverVersion),
-                VK_VERSION_MINOR(props.driverVersion), VK_VERSION_PATCH(props.driverVersion));
-    std::printf("API version: %u.%u.%u\n", VK_VERSION_MAJOR(props.apiVersion),
-                VK_VERSION_MINOR(props.apiVersion), VK_VERSION_PATCH(props.apiVersion));
-    std::printf("Compute queue family: %u\n", computeQueueFamily);
-    std::printf("Translation layer (MoltenVK/Metal, timings not native): %s\n",
-                isTranslationLayer ? "yes" : "no");
-
-    // --- Teardown ---
-    vkDestroyDevice(device, nullptr);
-    if (messenger != VK_NULL_HANDLE) {
-        auto destroyFn = reinterpret_cast<PFN_vkDestroyDebugUtilsMessengerEXT>(
-            vkGetInstanceProcAddr(instance, "vkDestroyDebugUtilsMessengerEXT"));
-        if (destroyFn) destroyFn(instance, messenger, nullptr);
-    }
-    vkDestroyInstance(instance, nullptr);
-
-    return EXIT_SUCCESS;
+    std::printf("\n%s (%d/%zu cases failed)\n", failures == 0 ? "ALL PASS" : "FAILURES",
+                failures, sizeof(cases) / sizeof(cases[0]));
+    return failures == 0 ? EXIT_SUCCESS : EXIT_FAILURE;
 }
