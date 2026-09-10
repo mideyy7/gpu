@@ -58,10 +58,10 @@ numbers would need re-capture there.
 
 ## Build
 
-Requires: CMake ≥ 3.20, a C++17 compiler, the Vulkan SDK / loader, `glslc`,
-and the Khronos validation layer.
+Requires: CMake ≥ 3.20, a C++17 compiler, the Vulkan loader + headers,
+`glslc`, and the Khronos validation layer.
 
-macOS (Homebrew):
+### macOS (Homebrew)
 
 ```
 brew install vulkan-headers vulkan-loader vulkan-tools \
@@ -70,13 +70,105 @@ cmake -S . -B build
 cmake --build build
 ```
 
-Linux (LunarG SDK on PATH): the same two `cmake` commands.
+### Linux
 
-Regenerating the scaling chart additionally needs Python 3 + matplotlib
-(`pip install matplotlib`); the committed `docs/scaling.svg` is already
-up to date, so this is only for re-running the sweep.
+This is the target platform — the numbers in this README are via MoltenVK
+and should be re-captured here (see **Platform note** above).
+
+**1. Install the toolchain and Vulkan runtime.**
+
+Debian / Ubuntu:
+
+```
+sudo apt update
+sudo apt install build-essential cmake git \
+                 libvulkan-dev vulkan-tools vulkan-validationlayers glslc
+```
+
+Fedora:
+
+```
+sudo dnf install gcc-c++ cmake git \
+                 vulkan-loader-devel vulkan-tools vulkan-validation-layers glslc
+```
+
+Arch:
+
+```
+sudo pacman -S base-devel cmake git vulkan-icd-loader vulkan-tools \
+               vulkan-validation-layers shaderc
+```
+
+If your distro has no `glslc` package, install the
+[LunarG Vulkan SDK](https://vulkan.lunarg.com/sdk/home#linux) and
+`source ~/vulkan-sdk/*/setup-env.sh` — that puts `glslc` on `PATH` and the
+validation layer on the loader's search path.
+
+**2. Install a GPU driver / Vulkan ICD** (skip if you already game / run
+Vulkan on this machine):
+
+- AMD or Intel: `sudo apt install mesa-vulkan-drivers` (RADV / ANV).
+- NVIDIA: the proprietary `nvidia-driver-###` package (Mesa's NVK also
+  works on recent kernels).
+
+Verify the GPU is visible:
+
+```
+vulkaninfo --summary        # should list your GPU with driverVersion etc.
+```
+
+> **No GPU / CI box?** `mesa-vulkan-drivers` also ships **lavapipe**
+> (`llvmpipe`), a CPU software Vulkan implementation. The project builds and
+> its self-tests pass on it, but timing numbers are meaningless (no real
+> GPU). Force it with `VK_ICD_FILENAMES=/usr/share/vulkan/icd.d/lvp_icd.*.json`.
+
+**3. Build:**
+
+```
+cmake -S . -B build
+cmake --build build -j
+```
+
+Produces `build/profiler` and `build/libVkLayer_gcp_profiler.so` +
+`build/VkLayer_gcp_profiler.json`.
+
+Regenerating the charts additionally needs Python 3 + matplotlib
+(`pip install matplotlib` or `sudo apt install python3-matplotlib`); the
+committed `docs/*.svg` are already up to date.
 
 ## Run
+
+### Linux
+
+On Linux the distro/SDK puts the validation layer on the loader's default
+search path, so **run the binary directly** — `scripts/run.sh` also works
+(its `DYLD_LIBRARY_PATH` shim is a no-op off macOS) but isn't needed.
+
+```
+./build/profiler                                           # correctness self-tests
+./build/profiler --report                                  # profiling run, default N=8192
+./build/profiler --report --particles 16384 --steps 300 --warmup 30
+./build/profiler --report --particles 8192 --csv run.csv   # per-step CSV
+./build/profiler --report --particles 2048 --batch 32      # batched submit
+./build/profiler --sweep --batch 1 --csv docs/sweep.csv    # scaling sweep
+python3 scripts/plot_sweep.py                              # -> docs/scaling.svg
+```
+
+With the reusable layer active (see **Reusable profiling layer** below):
+
+```
+VK_ADD_LAYER_PATH="$PWD/build" VK_INSTANCE_LAYERS=VK_LAYER_gcp_profiler \
+  ./build/profiler --report --particles 2048 --batch 1
+# or just: ./scripts/run_layer.sh --report --particles 2048 --batch 1
+```
+
+Expected on a healthy setup: the run prints a real GPU name on the `Device:`
+line (no `[translation layer]` tag), `Validation: enabled`, and **zero**
+`[validation]` / `VUID` lines on stderr. If `Validation: disabled` appears,
+the validation layer isn't on the search path — install
+`vulkan-validationlayers` or source the LunarG `setup-env.sh`.
+
+### macOS
 
 ```
 ./scripts/run.sh                          # correctness self-tests (see below)
@@ -87,12 +179,11 @@ up to date, so this is only for re-running the sweep.
 ./scripts/run.sh --sweep  --batch 1  --csv docs/sweep.csv
 ```
 
+`scripts/run.sh` sets `DYLD_LIBRARY_PATH` so the loader finds the Homebrew
+validation-layer dylib; on Linux you don't need it.
+
 `--batch K` records K simulation steps per command buffer / submit (default
 1). See **Bottleneck fix** below.
-
-`scripts/run.sh` just sets `DYLD_LIBRARY_PATH` so the loader finds the
-Homebrew validation-layer dylib on macOS; on Linux you can run
-`./build/profiler` directly.
 
 ### Self-tests (no arguments)
 
@@ -204,11 +295,13 @@ left to amortise. Full write-up: `docs/bottleneck.md`.
 
 ## Reusable profiling layer
 
-`layer/gcp_layer.cpp` builds `libVkLayer_gcp_profiler.dylib` +
-`VkLayer_gcp_profiler.json` — a Vulkan layer that instruments **any** Vulkan
-app without recompiling it. It intercepts `vkQueueSubmit`, the fence/idle
-waits, and `vkCmdDispatch` / `vkCmdPipelineBarrier` / `vkCmdCopyBuffer`, and
-prints an aggregated report on `vkDestroyDevice`:
+`layer/gcp_layer.cpp` builds `libVkLayer_gcp_profiler.{dylib,so}` +
+`VkLayer_gcp_profiler.json` (the manifest's `library_path` is filled in by
+CMake for the platform you built on) — a Vulkan layer that instruments
+**any** Vulkan app without recompiling it. It intercepts `vkQueueSubmit`,
+the fence/idle waits, and `vkCmdDispatch` / `vkCmdPipelineBarrier` /
+`vkCmdCopyBuffer`, and prints an aggregated report on `vkDestroyDevice`.
+`scripts/run_layer.sh` works on both macOS and Linux:
 
 ```
 ./scripts/run_layer.sh --report --particles 2048 --steps 64 --batch 1
