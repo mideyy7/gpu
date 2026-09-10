@@ -67,7 +67,12 @@ up to date, so this is only for re-running the sweep.
 ./scripts/run.sh --report                 # profiling run, default N=8192
 ./scripts/run.sh --report --particles 16384 --steps 300 --warmup 30
 ./scripts/run.sh --report --particles 8192 --csv run.csv   # per-step CSV
+./scripts/run.sh --report --particles 2048 --batch 32      # batched submit
+./scripts/run.sh --sweep  --batch 1  --csv docs/sweep.csv
 ```
+
+`--batch K` records K simulation steps per command buffer / submit (default
+1). See **Bottleneck fix** below.
 
 `scripts/run.sh` just sets `DYLD_LIBRARY_PATH` so the loader finds the
 Homebrew validation-layer dylib on macOS; on Linux you can run
@@ -86,8 +91,11 @@ Runs three correctness checks and exits non-zero on any failure:
   Worst relative drift observed ~1e-6.
 - **timestamp sanity** — ticks monotonic within a submission, every stage
   duration in [0, 1 s], GPU span ≤ wall-clock frame, for N up to 4096.
+- **batch equivalence** — a run split into batches of {16, 25, 32} steps per
+  submit produces a bit-identical particle state to running one step per
+  submit (`max |Δ| == 0`).
 
-All three pass with **zero Vulkan validation errors or warnings**.
+All pass with **zero Vulkan validation errors or warnings**.
 
 ## Sample output
 
@@ -153,6 +161,31 @@ The fixed-cost stages (both barriers, integrate, readback copy) stay in the
 20–60 µs band with no upward trend across a 128× range of N — on this setup
 the pipeline is never barrier- or transfer-bound, only force-kernel bound.
 
+## Bottleneck fix (found with this profiler)
+
+The breakdown showed `frame_total − gpu_total` — wall time *not* spent on GPU
+work — sitting at **~0.6 ms and flat in N**: a fixed per-step cost, mostly
+`vkQueueSubmit` + fence-signal latency, paid once for every step because the
+loop did one command-buffer submit per step and blocked on its fence.
+
+**Fix:** `runBatch(K)` records K steps into one command buffer with one
+submit and one fence wait, the intra-batch write→read hazard carried by a
+`COMPUTE→COMPUTE` pipeline barrier on the particle buffer instead of a host
+round-trip. Result is bit-identical (asserted in the self-tests).
+
+| N     | batch = 1 | batch = 32 | speed-up |
+|-------|-----------|-----------:|---------:|
+| 1024  | 1296 µs   | 368 µs     | **3.5×** |
+| 2048  | 1872 µs   | 451 µs     | **4.2×** |
+| 4096  | 2438 µs   | 899 µs     | 2.7×     |
+| 16384 | 14040 µs  | 13544 µs   | 1.04×    |
+
+![batching before/after](docs/batching.svg)
+
+The gain is confined to the overhead-bound regime (N ≤ ~4096) and vanishes
+once the O(N²) force kernel dominates the frame (N ≳ 8192) — there is nothing
+left to amortise. Full write-up: `docs/bottleneck.md`.
+
 ## Repository layout
 
 ```
@@ -163,13 +196,19 @@ src/
   report.*       cross-step aggregation + table / CSV output
   main.cpp       arg parsing, self-tests, --report mode
 scripts/
-  run.sh         runtime env shim for macOS
-  plot_sweep.py  sweep CSV -> docs/scaling.svg
-docs/            synchronisation write-up, sweep CSV, scaling chart
+  run.sh          runtime env shim for macOS
+  plot_sweep.py   sweep CSV -> docs/scaling.svg
+  plot_batching.py  batch1 vs batch32 CSVs -> docs/batching.svg
+docs/
+  synchronisation.md  timestamp-model write-up
+  bottleneck.md       the batching fix, before/after
+  sweep.csv, sweep_batch32.csv, *.svg
 plan.md          phase-by-phase build plan
 ```
 
 ## See also
 
-`docs/synchronisation.md` — one non-obvious thing about Vulkan's timestamp /
-synchronisation model that this project surfaced.
+- `docs/synchronisation.md` — one non-obvious thing about Vulkan's timestamp /
+  synchronisation model that this project surfaced.
+- `docs/bottleneck.md` — the per-step-submit bottleneck, its root cause, and
+  the batching fix with before/after numbers.

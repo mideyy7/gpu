@@ -25,6 +25,11 @@ struct SimParams {
     float dt = 0.005f;
 };
 
+// Timestamps written per simulation step, and the largest batch runBatch()
+// accepts (query pool is sized kTimestampsPerStep * kMaxBatch).
+static constexpr uint32_t kTimestampsPerStep = 6;
+static constexpr uint32_t kMaxBatch = 64;
+
 // Per-step timing, all fields in nanoseconds. GPU-side numbers come from
 // timestamp query deltas; CPU-side numbers from steady_clock around submit.
 struct StepTimings {
@@ -58,10 +63,17 @@ class Simulation {
 
     // force_calc + barrier + copy(accel -> readback). No integration.
     void runForceCalcOnce();
-    // Full step: force + barrier + integrate + barrier + copy(particles -> readback).
-    void stepOnce();
 
-    const StepTimings& lastTimings() const { return lastTimings_; }
+    // Advance `steps` simulation steps recorded into ONE command buffer and
+    // ONE submit, with a single readback copy at the end. Batching amortises
+    // the fixed per-submit CPU<->GPU round-trip over the steps in the batch.
+    // Per-step timings land in lastBatchTimings(); stepOnce() == runBatch(1).
+    void runBatch(uint32_t steps);
+    void stepOnce() { runBatch(1); }
+
+    const std::vector<StepTimings>& lastBatchTimings() const { return lastBatch_; }
+    const StepTimings& lastTimings() const { return lastBatch_.back(); }
+    uint32_t maxBatch() const { return kMaxBatch; }
     bool timestampsSupported() const { return timestampsSupported_; }
 
     std::vector<Vec3> readAccelerations();
@@ -71,6 +83,7 @@ class Simulation {
     void createBuffers(const std::vector<Particle>& initial);
     void createPipelines();
     void createQueryPool();
+    void createLoopObjects();
     VkCommandBuffer beginCommands();
     void submitAndWait(VkCommandBuffer cmd);
 
@@ -97,13 +110,16 @@ class Simulation {
 
     VkCommandPool commandPool_ = VK_NULL_HANDLE;
 
+    // Reused across every stepOnce() -- allocated once, not per step.
+    VkCommandBuffer loopCmd_ = VK_NULL_HANDLE;
+    VkFence loopFence_ = VK_NULL_HANDLE;
+    void* readbackMapped_ = nullptr;  // persistent mapping of readbackMemory_
+
     VkQueryPool queryPool_ = VK_NULL_HANDLE;
     bool timestampsSupported_ = false;
     float timestampPeriod_ = 1.0f;
-    StepTimings lastTimings_{};
+    std::vector<StepTimings> lastBatch_{StepTimings{}};
 };
-
-static constexpr uint32_t kTimestampCount = 6;
 
 // Reference CPU implementation of the same O(N^2) force accumulation, in the
 // same j = 0..N-1 iteration order as the shader.

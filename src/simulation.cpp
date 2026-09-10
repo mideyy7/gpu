@@ -54,6 +54,28 @@ void Simulation::init(VulkanContext& ctx, const SimParams& params,
     createBuffers(initial);
     createPipelines();
     createQueryPool();
+    createLoopObjects();
+}
+
+void Simulation::createLoopObjects() {
+    auto& ctx = *ctx_;
+
+    VkCommandBufferAllocateInfo cbAlloc{};
+    cbAlloc.sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_ALLOCATE_INFO;
+    cbAlloc.commandPool = commandPool_;
+    cbAlloc.level = VK_COMMAND_BUFFER_LEVEL_PRIMARY;
+    cbAlloc.commandBufferCount = 1;
+    check(vkAllocateCommandBuffers(ctx.device, &cbAlloc, &loopCmd_),
+          "vkAllocateCommandBuffers");
+
+    VkFenceCreateInfo fenceInfo{};
+    fenceInfo.sType = VK_STRUCTURE_TYPE_FENCE_CREATE_INFO;
+    check(vkCreateFence(ctx.device, &fenceInfo, nullptr, &loopFence_), "vkCreateFence");
+
+    // HOST_VISIBLE|HOST_COHERENT: map once for the buffer's lifetime and read
+    // straight from the pointer -- no per-step vkMapMemory/vkUnmapMemory.
+    check(vkMapMemory(ctx.device, readbackMemory_, 0, VK_WHOLE_SIZE, 0, &readbackMapped_),
+          "vkMapMemory");
 }
 
 void Simulation::createQueryPool() {
@@ -72,7 +94,7 @@ void Simulation::createQueryPool() {
     VkQueryPoolCreateInfo info{};
     info.sType = VK_STRUCTURE_TYPE_QUERY_POOL_CREATE_INFO;
     info.queryType = VK_QUERY_TYPE_TIMESTAMP;
-    info.queryCount = kTimestampCount;
+    info.queryCount = kTimestampsPerStep * kMaxBatch;
     check(vkCreateQueryPool(ctx.device, &info, nullptr, &queryPool_), "vkCreateQueryPool");
 }
 
@@ -270,76 +292,84 @@ void Simulation::runForceCalcOnce() {
     submitAndWait(cmd);
 }
 
-void Simulation::stepOnce() {
+void Simulation::runBatch(uint32_t steps) {
+    if (steps == 0) steps = 1;
+    if (steps > kMaxBatch) steps = kMaxBatch;
+
     auto& ctx = *ctx_;
     const bool ts = timestampsSupported_;
     const Clock::time_point tRecordStart = Clock::now();
 
-    VkCommandBuffer cmd = beginCommands();
+    // One command buffer, one submit, one fence wait for the whole batch.
+    check(vkResetCommandBuffer(loopCmd_, 0), "vkResetCommandBuffer");
+    VkCommandBuffer cmd = loopCmd_;
+    VkCommandBufferBeginInfo begin{};
+    begin.sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO;
+    begin.flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT;
+    check(vkBeginCommandBuffer(cmd, &begin), "vkBeginCommandBuffer");
+
     PushConstants pc{params_.particleCount, params_.gravity, params_.softening, params_.dt};
     uint32_t groups = (params_.particleCount + 63) / 64;
 
-    if (ts) vkCmdResetQueryPool(cmd, queryPool_, 0, kTimestampCount);
+    if (ts) vkCmdResetQueryPool(cmd, queryPool_, 0, kTimestampsPerStep * steps);
 
     vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, pipelineLayout_, 0, 1,
                             &descriptorSet_, 0, nullptr);
     vkCmdPushConstants(cmd, pipelineLayout_, VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof(pc), &pc);
 
-    // [0] before force dispatch
-    if (ts)
-        vkCmdWriteTimestamp(cmd, VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT, queryPool_, 0);
+    auto memBarrier = [&](VkAccessFlags src, VkAccessFlags dst, VkPipelineStageFlags srcS,
+                          VkPipelineStageFlags dstS) {
+        VkMemoryBarrier b{};
+        b.sType = VK_STRUCTURE_TYPE_MEMORY_BARRIER;
+        b.srcAccessMask = src;
+        b.dstAccessMask = dst;
+        vkCmdPipelineBarrier(cmd, srcS, dstS, 0, 1, &b, 0, nullptr, 0, nullptr);
+    };
+    auto stamp = [&](uint32_t q, VkPipelineStageFlagBits stage) {
+        if (ts) vkCmdWriteTimestamp(cmd, stage, queryPool_, q);
+    };
 
-    vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, forceCalcPipeline_);
-    vkCmdDispatch(cmd, groups, 1, 1);
+    for (uint32_t s = 0; s < steps; ++s) {
+        const uint32_t base = kTimestampsPerStep * s;
+        const bool last = (s + 1 == steps);
 
-    // [1] after force dispatch / before barrier 1
-    if (ts)
-        vkCmdWriteTimestamp(cmd, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, queryPool_, 1);
+        stamp(base + 0, VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT);
+        vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, forceCalcPipeline_);
+        vkCmdDispatch(cmd, groups, 1, 1);
+        stamp(base + 1, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT);
 
-    // accel: shader write -> shader read hazard before integrate consumes it.
-    VkMemoryBarrier computeToCompute{};
-    computeToCompute.sType = VK_STRUCTURE_TYPE_MEMORY_BARRIER;
-    computeToCompute.srcAccessMask = VK_ACCESS_SHADER_WRITE_BIT;
-    computeToCompute.dstAccessMask = VK_ACCESS_SHADER_READ_BIT;
-    vkCmdPipelineBarrier(cmd, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
-                         VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, 0, 1, &computeToCompute, 0,
-                         nullptr, 0, nullptr);
+        // accel: shader write -> shader read, before integrate consumes it.
+        memBarrier(VK_ACCESS_SHADER_WRITE_BIT, VK_ACCESS_SHADER_READ_BIT,
+                   VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
+                   VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT);
+        stamp(base + 2, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT);
 
-    // [2] after barrier 1 / before integrate dispatch
-    if (ts)
-        vkCmdWriteTimestamp(cmd, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, queryPool_, 2);
+        vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, integratePipeline_);
+        vkCmdDispatch(cmd, groups, 1, 1);
+        stamp(base + 3, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT);
 
-    vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, integratePipeline_);
-    vkCmdDispatch(cmd, groups, 1, 1);
-
-    // [3] after integrate dispatch / before barrier 2
-    if (ts)
-        vkCmdWriteTimestamp(cmd, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, queryPool_, 3);
-
-    // particles: shader write -> transfer read before the readback copy.
-    VkMemoryBarrier computeToTransfer{};
-    computeToTransfer.sType = VK_STRUCTURE_TYPE_MEMORY_BARRIER;
-    computeToTransfer.srcAccessMask = VK_ACCESS_SHADER_WRITE_BIT;
-    computeToTransfer.dstAccessMask = VK_ACCESS_TRANSFER_READ_BIT;
-    vkCmdPipelineBarrier(cmd, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
-                         VK_PIPELINE_STAGE_TRANSFER_BIT, 0, 1, &computeToTransfer, 0, nullptr,
-                         0, nullptr);
-
-    // [4] after barrier 2 / before readback copy
-    if (ts) vkCmdWriteTimestamp(cmd, VK_PIPELINE_STAGE_TRANSFER_BIT, queryPool_, 4);
-
-    VkBufferCopy region{0, 0, particleBytes_};
-    vkCmdCopyBuffer(cmd, particleBuffer_, readbackBuffer_, 1, &region);
-
-    // [5] after readback copy
-    if (ts) vkCmdWriteTimestamp(cmd, VK_PIPELINE_STAGE_TRANSFER_BIT, queryPool_, 5);
+        if (last) {
+            // particles: shader write -> transfer read, before the readback.
+            memBarrier(VK_ACCESS_SHADER_WRITE_BIT, VK_ACCESS_TRANSFER_READ_BIT,
+                       VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
+                       VK_PIPELINE_STAGE_TRANSFER_BIT);
+            stamp(base + 4, VK_PIPELINE_STAGE_TRANSFER_BIT);
+            VkBufferCopy region{0, 0, particleBytes_};
+            vkCmdCopyBuffer(cmd, particleBuffer_, readbackBuffer_, 1, &region);
+            stamp(base + 5, VK_PIPELINE_STAGE_TRANSFER_BIT);
+        } else {
+            // particles: shader write -> shader read, before next step's
+            // force_calc reads the updated positions.
+            memBarrier(VK_ACCESS_SHADER_WRITE_BIT, VK_ACCESS_SHADER_READ_BIT,
+                       VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
+                       VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT);
+            stamp(base + 4, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT);
+            stamp(base + 5, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT);  // no copy this step
+        }
+    }
 
     check(vkEndCommandBuffer(cmd), "vkEndCommandBuffer");
-
-    VkFenceCreateInfo fenceInfo{};
-    fenceInfo.sType = VK_STRUCTURE_TYPE_FENCE_CREATE_INFO;
-    VkFence fence = VK_NULL_HANDLE;
-    check(vkCreateFence(ctx.device, &fenceInfo, nullptr, &fence), "vkCreateFence");
+    check(vkResetFences(ctx.device, 1, &loopFence_), "vkResetFences");
 
     VkSubmitInfo submit{};
     submit.sType = VK_STRUCTURE_TYPE_SUBMIT_INFO;
@@ -347,27 +377,41 @@ void Simulation::stepOnce() {
     submit.pCommandBuffers = &cmd;
 
     const Clock::time_point tBeforeSubmit = Clock::now();
-    check(vkQueueSubmit(ctx.computeQueue, 1, &submit, fence), "vkQueueSubmit");
+    check(vkQueueSubmit(ctx.computeQueue, 1, &submit, loopFence_), "vkQueueSubmit");
     const Clock::time_point tAfterSubmit = Clock::now();
-    check(vkWaitForFences(ctx.device, 1, &fence, VK_TRUE, UINT64_MAX), "vkWaitForFences");
+    check(vkWaitForFences(ctx.device, 1, &loopFence_, VK_TRUE, UINT64_MAX),
+          "vkWaitForFences");
     const Clock::time_point tAfterWait = Clock::now();
 
-    StepTimings out{};
-    out.timestampPeriodNs = timestampPeriod_;
-    out.submitCallNs = nanosBetween(tBeforeSubmit, tAfterSubmit);
-    out.cpuWaitNs = nanosBetween(tAfterSubmit, tAfterWait);
-    out.frameTotalNs = nanosBetween(tRecordStart, tAfterWait);
+    // Per-submit CPU costs are amortised across the batch: each step is
+    // charged an equal share so aggregates stay comparable across batch sizes.
+    const double submitPer = nanosBetween(tBeforeSubmit, tAfterSubmit) / steps;
+    const double waitPer = nanosBetween(tAfterSubmit, tAfterWait) / steps;
+    const double framePer = nanosBetween(tRecordStart, tAfterWait) / steps;
 
+    std::vector<uint64_t> ticks(kTimestampsPerStep * steps);
+    bool gpuOk = false;
     if (ts) {
-        uint64_t ticks[kTimestampCount] = {};
         VkResult r = vkGetQueryPoolResults(
-            ctx.device, queryPool_, 0, kTimestampCount, sizeof(ticks), ticks,
-            sizeof(uint64_t), VK_QUERY_RESULT_64_BIT | VK_QUERY_RESULT_WAIT_BIT);
-        if (r == VK_SUCCESS) {
+            ctx.device, queryPool_, 0, kTimestampsPerStep * steps,
+            ticks.size() * sizeof(uint64_t), ticks.data(), sizeof(uint64_t),
+            VK_QUERY_RESULT_64_BIT | VK_QUERY_RESULT_WAIT_BIT);
+        gpuOk = (r == VK_SUCCESS);
+    }
+
+    lastBatch_.assign(steps, StepTimings{});
+    for (uint32_t s = 0; s < steps; ++s) {
+        StepTimings& out = lastBatch_[s];
+        out.timestampPeriodNs = timestampPeriod_;
+        out.submitCallNs = submitPer;
+        out.cpuWaitNs = waitPer;
+        out.frameTotalNs = framePer;
+        if (gpuOk) {
+            const uint64_t* t = &ticks[kTimestampsPerStep * s];
             out.gpuValid = true;
-            for (uint32_t i = 0; i < kTimestampCount; ++i) out.rawTicks[i] = ticks[i];
+            for (uint32_t i = 0; i < kTimestampsPerStep; ++i) out.rawTicks[i] = t[i];
             auto span = [&](int a, int b) {
-                return static_cast<double>(ticks[b] - ticks[a]) * timestampPeriod_;
+                return static_cast<double>(t[b] - t[a]) * timestampPeriod_;
             };
             out.forceDispatchNs = span(0, 1);
             out.barrier1Ns = span(1, 2);
@@ -377,34 +421,20 @@ void Simulation::stepOnce() {
             out.gpuTotalNs = span(0, 5);
         }
     }
-    lastTimings_ = out;
-
-    vkDestroyFence(ctx.device, fence, nullptr);
-    vkFreeCommandBuffers(ctx.device, commandPool_, 1, &cmd);
 }
 
 std::vector<Vec3> Simulation::readAccelerations() {
-    auto& ctx = *ctx_;
-    void* mapped = nullptr;
-    check(vkMapMemory(ctx.device, readbackMemory_, accelReadbackOffset_, accelBytes_, 0,
-                      &mapped),
-          "vkMapMemory");
-    const float* f = static_cast<const float*>(mapped);
+    const float* f = reinterpret_cast<const float*>(
+        static_cast<const char*>(readbackMapped_) + accelReadbackOffset_);
     std::vector<Vec3> out(params_.particleCount);
     for (uint32_t i = 0; i < params_.particleCount; ++i)
         out[i] = {f[i * 4 + 0], f[i * 4 + 1], f[i * 4 + 2]};
-    vkUnmapMemory(ctx.device, readbackMemory_);
     return out;
 }
 
 std::vector<Particle> Simulation::readParticles() {
-    auto& ctx = *ctx_;
-    void* mapped = nullptr;
-    check(vkMapMemory(ctx.device, readbackMemory_, 0, particleBytes_, 0, &mapped),
-          "vkMapMemory");
     std::vector<Particle> out(params_.particleCount);
-    std::memcpy(out.data(), mapped, static_cast<size_t>(particleBytes_));
-    vkUnmapMemory(ctx.device, readbackMemory_);
+    std::memcpy(out.data(), readbackMapped_, static_cast<size_t>(particleBytes_));
     return out;
 }
 
@@ -412,6 +442,11 @@ void Simulation::destroy() {
     if (!ctx_) return;
     VkDevice d = ctx_->device;
     vkDeviceWaitIdle(d);
+    if (readbackMapped_) {
+        vkUnmapMemory(d, readbackMemory_);
+        readbackMapped_ = nullptr;
+    }
+    if (loopFence_) vkDestroyFence(d, loopFence_, nullptr);
     if (queryPool_) vkDestroyQueryPool(d, queryPool_, nullptr);
     if (forceCalcPipeline_) vkDestroyPipeline(d, forceCalcPipeline_, nullptr);
     if (integratePipeline_) vkDestroyPipeline(d, integratePipeline_, nullptr);

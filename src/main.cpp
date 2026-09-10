@@ -1,3 +1,4 @@
+#include <algorithm>
 #include <cmath>
 #include <cstdio>
 #include <cstdlib>
@@ -163,9 +164,55 @@ bool timestampCase(VulkanContext& ctx, uint32_t n, uint32_t warmup, uint32_t see
     return ok;
 }
 
+// --- Phase 8: batching must not change the simulation result ---
+bool batchEquivCase(VulkanContext& ctx, uint32_t n, uint32_t steps, uint32_t batch,
+                    uint32_t seed) {
+    SimParams params;
+    params.particleCount = n;
+    auto initial = makeParticles(n, seed);
+
+    auto runTo = [&](uint32_t b) {
+        Simulation sim;
+        sim.init(ctx, params, initial);
+        for (uint32_t done = 0; done < steps;) {
+            uint32_t k = std::min(b, steps - done);
+            sim.runBatch(k);
+            done += k;
+        }
+        auto out = sim.readParticles();
+        sim.destroy();
+        return out;
+    };
+
+    auto a = runTo(1);
+    auto c = runTo(batch);
+    float worst = 0.0f;
+    for (uint32_t i = 0; i < n; ++i) {
+        worst = std::max(worst, std::fabs(a[i].px - c[i].px));
+        worst = std::max(worst, std::fabs(a[i].py - c[i].py));
+        worst = std::max(worst, std::fabs(a[i].pz - c[i].pz));
+        worst = std::max(worst, std::fabs(a[i].vx - c[i].vx));
+    }
+    bool ok = worst == 0.0f;  // identical command stream -> bit-identical result
+    std::printf("  N=%-5u steps=%u batch=1 vs %u  max |delta| = %.3e  [%s]\n", n, steps,
+                batch, worst, ok ? "PASS" : "FAIL");
+    return ok;
+}
+
+// Advance `steps` steps in batches of `batch`, feeding every per-step timing
+// into `report`.
+void collectSteps(Simulation& sim, uint32_t steps, uint32_t batch, Report& report) {
+    for (uint32_t done = 0; done < steps;) {
+        uint32_t k = std::min(batch, steps - done);
+        sim.runBatch(k);
+        for (const auto& t : sim.lastBatchTimings()) report.addSample(t);
+        done += k;
+    }
+}
+
 // --- Phase 5: profiling run + report ---
 int runReport(VulkanContext& ctx, uint32_t particles, uint32_t steps, uint32_t warmup,
-              const std::string& csvPath) {
+              uint32_t batch, const std::string& csvPath) {
     SimParams params;
     params.particleCount = particles;
 
@@ -178,16 +225,14 @@ int runReport(VulkanContext& ctx, uint32_t particles, uint32_t steps, uint32_t w
     for (uint32_t i = 0; i < warmup; ++i) sim.stepOnce();
 
     Report report;
-    for (uint32_t i = 0; i < steps; ++i) {
-        sim.stepOnce();
-        report.addSample(sim.lastTimings());
-    }
+    collectSteps(sim, steps, batch, report);
 
     auto finalState = sim.readParticles();
     sim.destroy();
 
-    char header[256];
-    std::snprintf(header, sizeof(header), "Per-stage timing  N=%u  device=%s", particles,
+    char header[288];
+    std::snprintf(header, sizeof(header),
+                  "Per-stage timing  N=%u  batch=%u/submit  device=%s", particles, batch,
                   ctx.deviceSummary().c_str());
     report.printTable(stdout, header);
 
@@ -210,7 +255,7 @@ int runReport(VulkanContext& ctx, uint32_t particles, uint32_t steps, uint32_t w
 }
 
 // --- Phase 7: particle-count sweep ---
-int runSweep(VulkanContext& ctx, uint32_t steps, uint32_t warmup,
+int runSweep(VulkanContext& ctx, uint32_t steps, uint32_t warmup, uint32_t batch,
              const std::string& csvPath) {
     const uint32_t counts[] = {256, 512, 1024, 2048, 4096, 8192, 16384, 32768};
 
@@ -239,10 +284,7 @@ int runSweep(VulkanContext& ctx, uint32_t steps, uint32_t warmup,
         sim.init(ctx, params, initial);
         for (uint32_t i = 0; i < warmup; ++i) sim.stepOnce();
         Report r;
-        for (uint32_t i = 0; i < steps; ++i) {
-            sim.stepOnce();
-            r.addSample(sim.lastTimings());
-        }
+        collectSteps(sim, steps, batch, r);
         sim.destroy();
 
         const auto m = r.means();
@@ -266,7 +308,7 @@ int runSweep(VulkanContext& ctx, uint32_t steps, uint32_t warmup,
 
 int main(int argc, char** argv) {
     bool reportMode = false, sweepMode = false;
-    uint32_t particles = 8192, steps = 200, warmup = 10;
+    uint32_t particles = 8192, steps = 200, warmup = 10, batch = 1;
     std::string csvPath;
     for (int i = 1; i < argc; ++i) {
         std::string a = argv[i];
@@ -287,15 +329,19 @@ int main(int argc, char** argv) {
             steps = static_cast<uint32_t>(std::strtoul(next(), nullptr, 10));
         else if (a == "--warmup")
             warmup = static_cast<uint32_t>(std::strtoul(next(), nullptr, 10));
+        else if (a == "--batch")
+            batch = static_cast<uint32_t>(std::strtoul(next(), nullptr, 10));
         else if (a == "--csv")
             csvPath = next();
         else if (a == "--help" || a == "-h") {
             std::printf(
                 "usage: profiler [--report|--sweep] [--particles N] [--steps S]\n"
-                "                [--warmup W] [--csv PATH]\n"
+                "                [--warmup W] [--batch K] [--csv PATH]\n"
                 "  no args : run correctness self-tests (phases 2-4)\n"
                 "  --report: run the sim and print a per-stage timing breakdown\n"
-                "  --sweep : run across a range of N and emit one CSV row per N\n");
+                "  --sweep : run across a range of N and emit one CSV row per N\n"
+                "  --batch : simulation steps recorded per command buffer / submit\n"
+                "            (default 1; amortises the fixed submit+fence round-trip)\n");
             return EXIT_SUCCESS;
         } else {
             std::fprintf(stderr, "error: unknown argument '%s' (try --help)\n", a.c_str());
@@ -317,8 +363,8 @@ int main(int argc, char** argv) {
     if (reportMode || sweepMode) {
         int rc;
         try {
-            rc = sweepMode ? runSweep(ctx, steps, warmup, csvPath)
-                           : runReport(ctx, particles, steps, warmup, csvPath);
+            rc = sweepMode ? runSweep(ctx, steps, warmup, batch, csvPath)
+                           : runReport(ctx, particles, steps, warmup, batch, csvPath);
         } catch (const std::exception& e) {
             std::fprintf(stderr, "fatal: %s\n", e.what());
             ctx.destroy();
@@ -350,6 +396,13 @@ int main(int argc, char** argv) {
         const uint32_t tcounts[] = {256, 1024, 4096};
         for (uint32_t n : tcounts)
             if (!timestampCase(ctx, n, /*warmup=*/3, /*seed=*/5)) ++failures;
+
+        std::printf("\nPhase 8: step batching preserves the simulation result\n");
+        const struct {
+            uint32_t n, steps, batch;
+        } bcases[] = {{64, 96, 16}, {512, 64, 32}, {2048, 50, 25}};
+        for (const auto& c : bcases)
+            if (!batchEquivCase(ctx, c.n, c.steps, c.batch, /*seed=*/3)) ++failures;
     } catch (const std::exception& e) {
         std::fprintf(stderr, "fatal: %s\n", e.what());
         ctx.destroy();
