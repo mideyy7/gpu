@@ -1,10 +1,17 @@
 #include "simulation.h"
 
 #include <array>
+#include <chrono>
 #include <cmath>
 #include <cstring>
 #include <stdexcept>
 #include <string>
+
+using Clock = std::chrono::steady_clock;
+
+static double nanosBetween(Clock::time_point a, Clock::time_point b) {
+    return std::chrono::duration<double, std::nano>(b - a).count();
+}
 
 #ifndef SHADER_DIR
 #define SHADER_DIR "shaders"
@@ -46,6 +53,27 @@ void Simulation::init(VulkanContext& ctx, const SimParams& params,
 
     createBuffers(initial);
     createPipelines();
+    createQueryPool();
+}
+
+void Simulation::createQueryPool() {
+    auto& ctx = *ctx_;
+
+    uint32_t qCount = 0;
+    vkGetPhysicalDeviceQueueFamilyProperties(ctx.physicalDevice, &qCount, nullptr);
+    std::vector<VkQueueFamilyProperties> qProps(qCount);
+    vkGetPhysicalDeviceQueueFamilyProperties(ctx.physicalDevice, &qCount, qProps.data());
+    timestampsSupported_ =
+        qProps[ctx.computeQueueFamily].timestampValidBits != 0;
+    timestampPeriod_ = ctx.props.limits.timestampPeriod;
+
+    if (!timestampsSupported_) return;
+
+    VkQueryPoolCreateInfo info{};
+    info.sType = VK_STRUCTURE_TYPE_QUERY_POOL_CREATE_INFO;
+    info.queryType = VK_QUERY_TYPE_TIMESTAMP;
+    info.queryCount = kTimestampCount;
+    check(vkCreateQueryPool(ctx.device, &info, nullptr, &queryPool_), "vkCreateQueryPool");
 }
 
 void Simulation::createBuffers(const std::vector<Particle>& initial) {
@@ -243,16 +271,30 @@ void Simulation::runForceCalcOnce() {
 }
 
 void Simulation::stepOnce() {
+    auto& ctx = *ctx_;
+    const bool ts = timestampsSupported_;
+    const Clock::time_point tRecordStart = Clock::now();
+
     VkCommandBuffer cmd = beginCommands();
     PushConstants pc{params_.particleCount, params_.gravity, params_.softening, params_.dt};
     uint32_t groups = (params_.particleCount + 63) / 64;
+
+    if (ts) vkCmdResetQueryPool(cmd, queryPool_, 0, kTimestampCount);
 
     vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, pipelineLayout_, 0, 1,
                             &descriptorSet_, 0, nullptr);
     vkCmdPushConstants(cmd, pipelineLayout_, VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof(pc), &pc);
 
+    // [0] before force dispatch
+    if (ts)
+        vkCmdWriteTimestamp(cmd, VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT, queryPool_, 0);
+
     vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, forceCalcPipeline_);
     vkCmdDispatch(cmd, groups, 1, 1);
+
+    // [1] after force dispatch / before barrier 1
+    if (ts)
+        vkCmdWriteTimestamp(cmd, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, queryPool_, 1);
 
     // accel: shader write -> shader read hazard before integrate consumes it.
     VkMemoryBarrier computeToCompute{};
@@ -263,8 +305,16 @@ void Simulation::stepOnce() {
                          VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, 0, 1, &computeToCompute, 0,
                          nullptr, 0, nullptr);
 
+    // [2] after barrier 1 / before integrate dispatch
+    if (ts)
+        vkCmdWriteTimestamp(cmd, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, queryPool_, 2);
+
     vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, integratePipeline_);
     vkCmdDispatch(cmd, groups, 1, 1);
+
+    // [3] after integrate dispatch / before barrier 2
+    if (ts)
+        vkCmdWriteTimestamp(cmd, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, queryPool_, 3);
 
     // particles: shader write -> transfer read before the readback copy.
     VkMemoryBarrier computeToTransfer{};
@@ -275,10 +325,62 @@ void Simulation::stepOnce() {
                          VK_PIPELINE_STAGE_TRANSFER_BIT, 0, 1, &computeToTransfer, 0, nullptr,
                          0, nullptr);
 
+    // [4] after barrier 2 / before readback copy
+    if (ts) vkCmdWriteTimestamp(cmd, VK_PIPELINE_STAGE_TRANSFER_BIT, queryPool_, 4);
+
     VkBufferCopy region{0, 0, particleBytes_};
     vkCmdCopyBuffer(cmd, particleBuffer_, readbackBuffer_, 1, &region);
 
-    submitAndWait(cmd);
+    // [5] after readback copy
+    if (ts) vkCmdWriteTimestamp(cmd, VK_PIPELINE_STAGE_TRANSFER_BIT, queryPool_, 5);
+
+    check(vkEndCommandBuffer(cmd), "vkEndCommandBuffer");
+
+    VkFenceCreateInfo fenceInfo{};
+    fenceInfo.sType = VK_STRUCTURE_TYPE_FENCE_CREATE_INFO;
+    VkFence fence = VK_NULL_HANDLE;
+    check(vkCreateFence(ctx.device, &fenceInfo, nullptr, &fence), "vkCreateFence");
+
+    VkSubmitInfo submit{};
+    submit.sType = VK_STRUCTURE_TYPE_SUBMIT_INFO;
+    submit.commandBufferCount = 1;
+    submit.pCommandBuffers = &cmd;
+
+    const Clock::time_point tBeforeSubmit = Clock::now();
+    check(vkQueueSubmit(ctx.computeQueue, 1, &submit, fence), "vkQueueSubmit");
+    const Clock::time_point tAfterSubmit = Clock::now();
+    check(vkWaitForFences(ctx.device, 1, &fence, VK_TRUE, UINT64_MAX), "vkWaitForFences");
+    const Clock::time_point tAfterWait = Clock::now();
+
+    StepTimings out{};
+    out.timestampPeriodNs = timestampPeriod_;
+    out.submitCallNs = nanosBetween(tBeforeSubmit, tAfterSubmit);
+    out.cpuWaitNs = nanosBetween(tAfterSubmit, tAfterWait);
+    out.frameTotalNs = nanosBetween(tRecordStart, tAfterWait);
+
+    if (ts) {
+        uint64_t ticks[kTimestampCount] = {};
+        VkResult r = vkGetQueryPoolResults(
+            ctx.device, queryPool_, 0, kTimestampCount, sizeof(ticks), ticks,
+            sizeof(uint64_t), VK_QUERY_RESULT_64_BIT | VK_QUERY_RESULT_WAIT_BIT);
+        if (r == VK_SUCCESS) {
+            out.gpuValid = true;
+            for (uint32_t i = 0; i < kTimestampCount; ++i) out.rawTicks[i] = ticks[i];
+            auto span = [&](int a, int b) {
+                return static_cast<double>(ticks[b] - ticks[a]) * timestampPeriod_;
+            };
+            out.forceDispatchNs = span(0, 1);
+            out.barrier1Ns = span(1, 2);
+            out.integrateDispatchNs = span(2, 3);
+            out.barrier2Ns = span(3, 4);
+            out.copyNs = span(4, 5);
+            out.gpuTotalNs = span(0, 5);
+        }
+    }
+    lastTimings_ = out;
+
+    vkDestroyFence(ctx.device, fence, nullptr);
+    vkFreeCommandBuffers(ctx.device, commandPool_, 1, &cmd);
 }
 
 std::vector<Vec3> Simulation::readAccelerations() {
@@ -310,6 +412,7 @@ void Simulation::destroy() {
     if (!ctx_) return;
     VkDevice d = ctx_->device;
     vkDeviceWaitIdle(d);
+    if (queryPool_) vkDestroyQueryPool(d, queryPool_, nullptr);
     if (forceCalcPipeline_) vkDestroyPipeline(d, forceCalcPipeline_, nullptr);
     if (integratePipeline_) vkDestroyPipeline(d, integratePipeline_, nullptr);
     if (pipelineLayout_) vkDestroyPipelineLayout(d, pipelineLayout_, nullptr);

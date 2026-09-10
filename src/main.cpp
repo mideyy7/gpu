@@ -101,6 +101,65 @@ bool momentumCase(VulkanContext& ctx, uint32_t n, uint32_t seed, uint32_t steps,
     return ok;
 }
 
+// --- Phase 4: timestamp instrumentation sanity checks ---
+bool timestampCase(VulkanContext& ctx, uint32_t n, uint32_t warmup, uint32_t seed) {
+    SimParams params;
+    params.particleCount = n;
+
+    auto particles = makeParticles(n, seed);
+    Simulation sim;
+    sim.init(ctx, params, particles);
+
+    if (!sim.timestampsSupported()) {
+        std::printf("  timestamps unsupported on this queue -- skipping\n");
+        sim.destroy();
+        return true;
+    }
+
+    for (uint32_t i = 0; i < warmup; ++i) sim.stepOnce();
+    sim.stepOnce();
+    const StepTimings t = sim.lastTimings();
+    sim.destroy();
+
+    bool ok = true;
+    if (!t.gpuValid) {
+        std::printf("  [FAIL] GPU timestamps not readable\n");
+        return false;
+    }
+
+    for (uint32_t i = 1; i < 6; ++i) {
+        if (t.rawTicks[i] < t.rawTicks[i - 1]) {
+            std::printf("  [FAIL] non-monotonic ticks at %u: %llu < %llu\n", i,
+                        (unsigned long long)t.rawTicks[i],
+                        (unsigned long long)t.rawTicks[i - 1]);
+            ok = false;
+        }
+    }
+    const double stages[5] = {t.forceDispatchNs, t.barrier1Ns, t.integrateDispatchNs,
+                              t.barrier2Ns, t.copyNs};
+    for (double s : stages) {
+        if (s < 0.0 || s > 1e9) {
+            std::printf("  [FAIL] stage duration out of range: %.1f ns\n", s);
+            ok = false;
+        }
+    }
+    if (t.gpuTotalNs > t.frameTotalNs * 1.05 + 1e5) {
+        std::printf("  [FAIL] GPU total %.0f ns exceeds wall-clock frame %.0f ns\n",
+                    t.gpuTotalNs, t.frameTotalNs);
+        ok = false;
+    }
+
+    std::printf("  N=%-6u  force=%.1fus barrier1=%.1fus integrate=%.1fus "
+                "barrier2=%.1fus copy=%.1fus\n",
+                n, t.forceDispatchNs / 1e3, t.barrier1Ns / 1e3, t.integrateDispatchNs / 1e3,
+                t.barrier2Ns / 1e3, t.copyNs / 1e3);
+    std::printf("            gpuTotal=%.1fus  submitCall=%.1fus  cpuWait=%.1fus  "
+                "frameTotal=%.1fus  [%s]\n",
+                t.gpuTotalNs / 1e3, t.submitCallNs / 1e3, t.cpuWaitNs / 1e3,
+                t.frameTotalNs / 1e3, ok ? "PASS" : "FAIL");
+    return ok;
+}
+
 }  // namespace
 
 int main() {
@@ -132,6 +191,11 @@ int main() {
         } mcases[] = {{8, 7, 100}, {64, 11, 100}, {256, 42, 100}};
         for (const auto& c : mcases)
             if (!momentumCase(ctx, c.n, c.seed, c.steps, momTol)) ++failures;
+
+        std::printf("\nPhase 4: timestamp instrumentation sanity\n");
+        const uint32_t tcounts[] = {256, 1024, 4096};
+        for (uint32_t n : tcounts)
+            if (!timestampCase(ctx, n, /*warmup=*/3, /*seed=*/5)) ++failures;
     } catch (const std::exception& e) {
         std::fprintf(stderr, "fatal: %s\n", e.what());
         ctx.destroy();

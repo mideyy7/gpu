@@ -25,11 +25,31 @@ struct SimParams {
     float dt = 0.005f;
 };
 
+// Per-step timing, all fields in nanoseconds. GPU-side numbers come from
+// timestamp query deltas; CPU-side numbers from steady_clock around submit.
+struct StepTimings {
+    bool gpuValid = false;
+    uint64_t rawTicks[6] = {};
+    double timestampPeriodNs = 1.0;
+
+    double forceDispatchNs = 0;     // ticks[0]->[1]
+    double barrier1Ns = 0;          // ticks[1]->[2]  (accel write->read stall)
+    double integrateDispatchNs = 0; // ticks[2]->[3]
+    double barrier2Ns = 0;          // ticks[3]->[4]  (particle write->transfer stall)
+    double copyNs = 0;              // ticks[4]->[5]  (device->host readback)
+    double gpuTotalNs = 0;          // ticks[0]->[5]
+
+    double submitCallNs = 0;        // wall time inside vkQueueSubmit
+    double cpuWaitNs = 0;           // wall time inside vkWaitForFences
+    double frameTotalNs = 0;        // record start -> fence signalled
+};
+
 // GPU-side N-body simulation.
 //   force_calc  -> barrier -> integrate -> barrier -> copy to readback buffer
 // Particle/accel storage is DEVICE_LOCAL; a separate HOST_VISIBLE readback
 // buffer receives an explicit vkCmdCopyBuffer so the copy is a real,
-// measurable pipeline stage.
+// measurable pipeline stage. Every stepOnce() writes timestamps at all
+// stage boundaries; the result is available via lastTimings().
 class Simulation {
    public:
     void init(VulkanContext& ctx, const SimParams& params,
@@ -41,12 +61,16 @@ class Simulation {
     // Full step: force + barrier + integrate + barrier + copy(particles -> readback).
     void stepOnce();
 
+    const StepTimings& lastTimings() const { return lastTimings_; }
+    bool timestampsSupported() const { return timestampsSupported_; }
+
     std::vector<Vec3> readAccelerations();
     std::vector<Particle> readParticles();
 
    private:
     void createBuffers(const std::vector<Particle>& initial);
     void createPipelines();
+    void createQueryPool();
     VkCommandBuffer beginCommands();
     void submitAndWait(VkCommandBuffer cmd);
 
@@ -72,7 +96,14 @@ class Simulation {
     VkPipeline integratePipeline_ = VK_NULL_HANDLE;
 
     VkCommandPool commandPool_ = VK_NULL_HANDLE;
+
+    VkQueryPool queryPool_ = VK_NULL_HANDLE;
+    bool timestampsSupported_ = false;
+    float timestampPeriod_ = 1.0f;
+    StepTimings lastTimings_{};
 };
+
+static constexpr uint32_t kTimestampCount = 6;
 
 // Reference CPU implementation of the same O(N^2) force accumulation, in the
 // same j = 0..N-1 iteration order as the shader.
