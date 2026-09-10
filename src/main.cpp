@@ -209,10 +209,63 @@ int runReport(VulkanContext& ctx, uint32_t particles, uint32_t steps, uint32_t w
     return EXIT_SUCCESS;
 }
 
+// --- Phase 7: particle-count sweep ---
+int runSweep(VulkanContext& ctx, uint32_t steps, uint32_t warmup,
+             const std::string& csvPath) {
+    const uint32_t counts[] = {256, 512, 1024, 2048, 4096, 8192, 16384, 32768};
+
+    std::FILE* out = stdout;
+    std::FILE* fileOut = nullptr;
+    if (!csvPath.empty()) {
+        fileOut = std::fopen(csvPath.c_str(), "w");
+        if (!fileOut) {
+            std::fprintf(stderr, "error: cannot open %s\n", csvPath.c_str());
+            return EXIT_FAILURE;
+        }
+        out = fileOut;
+    }
+
+    std::fprintf(out,
+                 "n,force_us,barrier1_us,integrate_us,barrier2_us,copy_us,"
+                 "gpu_total_us,submit_us,cpu_wait_us,frame_total_us\n");
+    std::fflush(out);
+
+    for (uint32_t n : counts) {
+        SimParams params;
+        params.particleCount = n;
+        auto initial = makeParticles(n, /*seed=*/1);
+
+        Simulation sim;
+        sim.init(ctx, params, initial);
+        for (uint32_t i = 0; i < warmup; ++i) sim.stepOnce();
+        Report r;
+        for (uint32_t i = 0; i < steps; ++i) {
+            sim.stepOnce();
+            r.addSample(sim.lastTimings());
+        }
+        sim.destroy();
+
+        const auto m = r.means();
+        std::fprintf(out, "%u,%.2f,%.2f,%.2f,%.2f,%.2f,%.2f,%.2f,%.2f,%.2f\n", n,
+                     m.force / 1e3, m.barrier1 / 1e3, m.integrate / 1e3, m.barrier2 / 1e3,
+                     m.copy / 1e3, m.gpuTotal / 1e3, m.submitCall / 1e3, m.cpuWait / 1e3,
+                     m.frameTotal / 1e3);
+        std::fflush(out);
+        std::fprintf(stderr, "  N=%-6u frame=%.1fus force=%.1fus\n", n, m.frameTotal / 1e3,
+                     m.force / 1e3);
+    }
+
+    if (fileOut) {
+        std::fclose(fileOut);
+        std::fprintf(stderr, "wrote sweep CSV: %s\n", csvPath.c_str());
+    }
+    return EXIT_SUCCESS;
+}
+
 }  // namespace
 
 int main(int argc, char** argv) {
-    bool reportMode = false;
+    bool reportMode = false, sweepMode = false;
     uint32_t particles = 8192, steps = 200, warmup = 10;
     std::string csvPath;
     for (int i = 1; i < argc; ++i) {
@@ -226,6 +279,8 @@ int main(int argc, char** argv) {
         };
         if (a == "--report")
             reportMode = true;
+        else if (a == "--sweep")
+            sweepMode = true;
         else if (a == "--particles")
             particles = static_cast<uint32_t>(std::strtoul(next(), nullptr, 10));
         else if (a == "--steps")
@@ -236,10 +291,11 @@ int main(int argc, char** argv) {
             csvPath = next();
         else if (a == "--help" || a == "-h") {
             std::printf(
-                "usage: profiler [--report] [--particles N] [--steps S] [--warmup W]\n"
-                "                [--csv PATH]\n"
+                "usage: profiler [--report|--sweep] [--particles N] [--steps S]\n"
+                "                [--warmup W] [--csv PATH]\n"
                 "  no args : run correctness self-tests (phases 2-4)\n"
-                "  --report: run the sim and print a per-stage timing breakdown\n");
+                "  --report: run the sim and print a per-stage timing breakdown\n"
+                "  --sweep : run across a range of N and emit one CSV row per N\n");
             return EXIT_SUCCESS;
         } else {
             std::fprintf(stderr, "error: unknown argument '%s' (try --help)\n", a.c_str());
@@ -258,10 +314,11 @@ int main(int argc, char** argv) {
     std::printf("Device: %s\n", ctx.deviceSummary().c_str());
     std::printf("Validation: %s\n", ctx.validationEnabled ? "enabled" : "disabled");
 
-    if (reportMode) {
+    if (reportMode || sweepMode) {
         int rc;
         try {
-            rc = runReport(ctx, particles, steps, warmup, csvPath);
+            rc = sweepMode ? runSweep(ctx, steps, warmup, csvPath)
+                           : runReport(ctx, particles, steps, warmup, csvPath);
         } catch (const std::exception& e) {
             std::fprintf(stderr, "fatal: %s\n", e.what());
             ctx.destroy();

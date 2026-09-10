@@ -16,6 +16,12 @@ class Report {
     void printTable(std::FILE* out, const std::string& header) const;
     void writeCsv(std::FILE* out) const;
 
+    struct Means {
+        double force = 0, barrier1 = 0, integrate = 0, barrier2 = 0, copy = 0;
+        double gpuTotal = 0, submitCall = 0, cpuWait = 0, frameTotal = 0;
+    };
+    Means means() const;
+
     size_t sampleCount() const { return frameTotal_.size(); }
 
    private:

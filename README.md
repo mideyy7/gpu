@@ -56,6 +56,10 @@ cmake --build build
 
 Linux (LunarG SDK on PATH): the same two `cmake` commands.
 
+Regenerating the scaling chart additionally needs Python 3 + matplotlib
+(`pip install matplotlib`); the committed `docs/scaling.svg` is already
+up to date, so this is only for re-running the sweep.
+
 ## Run
 
 ```
@@ -128,6 +132,27 @@ frame total                  14812.3us   12528.5us   14293.0us   20986.8us   214
   the exact-arithmetic conservation is checked at moderate N in the
   self-tests).
 
+## Scaling sweep
+
+`./scripts/run.sh --sweep --csv docs/sweep.csv` runs the sim across
+N = 256 … 32768 and writes one row of mean per-stage times per N;
+`python3 scripts/plot_sweep.py` renders `docs/scaling.svg`.
+
+![per-stage scaling chart](docs/scaling.svg)
+
+Two regimes are visible in the force-calc kernel:
+
+- **N ≲ 4096 — launch-overhead bound.** Force time grows *sub*-linearly
+  (N 256→4096 is 16×, force time only ~13×). The all-pairs work is there but
+  the GPU isn't saturated, so fixed dispatch/scheduling cost dominates.
+- **N ≳ 8192 — compute bound.** Force time tracks slope ≈ 2 on log-log
+  (N 8192→16384→32768: ×4.75 then ×3.5 per 2× N) — the O(N²) of the kernel,
+  now that the machine is full.
+
+The fixed-cost stages (both barriers, integrate, readback copy) stay in the
+20–60 µs band with no upward trend across a 128× range of N — on this setup
+the pipeline is never barrier- or transfer-bound, only force-kernel bound.
+
 ## Repository layout
 
 ```
@@ -137,8 +162,10 @@ src/
   simulation.*   buffers, pipelines, barriers, timestamp query pool, step loop
   report.*       cross-step aggregation + table / CSV output
   main.cpp       arg parsing, self-tests, --report mode
-scripts/run.sh   runtime env shim for macOS
-docs/            synchronisation write-up
+scripts/
+  run.sh         runtime env shim for macOS
+  plot_sweep.py  sweep CSV -> docs/scaling.svg
+docs/            synchronisation write-up, sweep CSV, scaling chart
 plan.md          phase-by-phase build plan
 ```
 

@@ -91,6 +91,20 @@ void Report::printTable(std::FILE* out, const std::string& header) const {
                  g.mean > 0 ? 100.0 * accountedGpu / g.mean : 0.0);
 }
 
+Report::Means Report::means() const {
+    Means m;
+    m.force = summarize(force_).mean;
+    m.barrier1 = summarize(barrier1_).mean;
+    m.integrate = summarize(integrate_).mean;
+    m.barrier2 = summarize(barrier2_).mean;
+    m.copy = summarize(copy_).mean;
+    m.gpuTotal = summarize(gpuTotal_).mean;
+    m.submitCall = summarize(submitCall_).mean;
+    m.cpuWait = summarize(cpuWait_).mean;
+    m.frameTotal = summarize(frameTotal_).mean;
+    return m;
+}
+
 void Report::writeCsv(std::FILE* out) const {
     std::fprintf(out,
                  "step,force_ns,barrier1_ns,integrate_ns,barrier2_ns,copy_ns,"
