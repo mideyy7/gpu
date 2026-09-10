@@ -1,0 +1,11 @@
+{
+    "file_format_version": "1.2.0",
+    "layer": {
+        "name": "VK_LAYER_gcp_profiler",
+        "type": "GLOBAL",
+        "library_path": "@GCP_LAYER_LIB@",
+        "api_version": "1.2.0",
+        "implementation_version": "1",
+        "description": "GPU Compute Profiler layer: submit/command counts + CPU submit/wait timing"
+    }
+}

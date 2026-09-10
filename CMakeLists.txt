@@ -43,3 +43,21 @@ add_executable(profiler
 add_dependencies(profiler shaders)
 target_link_libraries(profiler PRIVATE Vulkan::Vulkan)
 target_compile_definitions(profiler PRIVATE SHADER_DIR="${SHADER_OUT_DIR}")
+
+# --- Reusable profiling layer (Phase 9) --------------------------------------
+# A layer sits between the app and the loader, so it links the Vulkan HEADERS
+# only, never the loader library.
+add_library(VkLayer_gcp_profiler SHARED layer/gcp_layer.cpp)
+set_target_properties(VkLayer_gcp_profiler PROPERTIES
+    CXX_VISIBILITY_PRESET hidden
+    PREFIX "lib")
+target_include_directories(VkLayer_gcp_profiler PRIVATE ${Vulkan_INCLUDE_DIRS})
+
+# Two-step manifest generation: configure_file expands @GCP_LAYER_LIB@ into a
+# generator expression, then file(GENERATE) resolves that to the real path.
+set(GCP_LAYER_LIB "$<TARGET_FILE:VkLayer_gcp_profiler>")
+configure_file(${CMAKE_SOURCE_DIR}/layer/VkLayer_gcp_profiler.json.in
+               ${CMAKE_BINARY_DIR}/VkLayer_gcp_profiler.json.genin @ONLY)
+file(GENERATE
+    OUTPUT ${CMAKE_BINARY_DIR}/VkLayer_gcp_profiler.json
+    INPUT  ${CMAKE_BINARY_DIR}/VkLayer_gcp_profiler.json.genin)

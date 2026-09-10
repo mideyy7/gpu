@@ -186,17 +186,58 @@ The gain is confined to the overhead-bound regime (N ≤ ~4096) and vanishes
 once the O(N²) force kernel dominates the frame (N ≳ 8192) — there is nothing
 left to amortise. Full write-up: `docs/bottleneck.md`.
 
+## Reusable profiling layer
+
+`layer/gcp_layer.cpp` builds `libVkLayer_gcp_profiler.dylib` +
+`VkLayer_gcp_profiler.json` — a Vulkan layer that instruments **any** Vulkan
+app without recompiling it. It intercepts `vkQueueSubmit`, the fence/idle
+waits, and `vkCmdDispatch` / `vkCmdPipelineBarrier` / `vkCmdCopyBuffer`, and
+prints an aggregated report on `vkDestroyDevice`:
+
+```
+./scripts/run_layer.sh --report --particles 2048 --steps 64 --batch 1
+
+[VK_LAYER_gcp_profiler] attached to new device
+=== VK_LAYER_gcp_profiler report ===
+  submits .............. 73
+  vkCmdDispatch ....... 144   (1.97 / submit)
+  vkCmdPipelineBarrier  144   (1.97 / submit)
+  vkCmdCopyBuffer ..... 73
+  fence / idle waits .. 74
+  CPU in vkQueueSubmit  7062.0 us total   96.7 us / submit
+  CPU in waits ........ 115953.4 us total   1566.9 us / wait
+```
+
+**Consistency with the in-app path** (same run): the layer's *CPU in waits
+per wait* (1566.9 µs) matches the in-app `fence wait (CPU)` mean (~1542 µs)
+to within a few percent, and the command counts match the recorded
+structure exactly (2 dispatches + 2 barriers + 1 copy per step). Re-run with
+`--batch 32` and the layer independently corroborates the Phase 8 fix:
+submits and copies drop 73 → 11, total CPU wait time 116 ms → 48 ms.
+
+The layer deliberately does **not** inject GPU timestamps into another app's
+command buffers, so the per-named-stage GPU breakdown (force / barrier /
+integrate / copy) stays with the in-app instrumentation, which knows what
+each dispatch *is*. Running under the layer stays validation-clean.
+
+`VK_ADD_LAYER_PATH` (additive) is used rather than `VK_LAYER_PATH`
+(replacing) so the validation layer is still discovered alongside it.
+
 ## Repository layout
 
 ```
 shaders/       force_calc.comp, integrate.comp  (GLSL -> SPIR-V via glslc)
 src/
   vk_context.*   instance / device / queue bring-up, validation, memory types
-  simulation.*   buffers, pipelines, barriers, timestamp query pool, step loop
+  simulation.*   buffers, pipelines, barriers, timestamp query pool, batched step loop
   report.*       cross-step aggregation + table / CSV output
-  main.cpp       arg parsing, self-tests, --report mode
+  main.cpp       arg parsing, self-tests, --report / --sweep modes
+layer/
+  gcp_layer.cpp             the reusable VK_LAYER_gcp_profiler layer
+  VkLayer_gcp_profiler.json.in  manifest template (library_path filled by CMake)
 scripts/
   run.sh          runtime env shim for macOS
+  run_layer.sh    run any app with VK_LAYER_gcp_profiler active
   plot_sweep.py   sweep CSV -> docs/scaling.svg
   plot_batching.py  batch1 vs batch32 CSVs -> docs/batching.svg
 docs/
