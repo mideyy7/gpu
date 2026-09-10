@@ -2,7 +2,6 @@
 
 #include <vulkan/vulkan.h>
 
-#include <array>
 #include <cstdint>
 #include <vector>
 
@@ -22,25 +21,34 @@ struct Particle {
 struct SimParams {
     uint32_t particleCount = 0;
     float gravity = 1.0f;
-    float softening = 0.1f;
-    float dt = 0.01f;
+    float softening = 0.5f;
+    float dt = 0.005f;
 };
 
-// GPU-side N-body simulation. Phase 2: force-calc dispatch + accel readback.
+// GPU-side N-body simulation.
+//   force_calc  -> barrier -> integrate -> barrier -> copy to readback buffer
+// Particle/accel storage is DEVICE_LOCAL; a separate HOST_VISIBLE readback
+// buffer receives an explicit vkCmdCopyBuffer so the copy is a real,
+// measurable pipeline stage.
 class Simulation {
    public:
     void init(VulkanContext& ctx, const SimParams& params,
               const std::vector<Particle>& initial);
     void destroy();
 
-    // Records force_calc, submits, waits on a fence. No instrumentation yet.
+    // force_calc + barrier + copy(accel -> readback). No integration.
     void runForceCalcOnce();
+    // Full step: force + barrier + integrate + barrier + copy(particles -> readback).
+    void stepOnce();
 
     std::vector<Vec3> readAccelerations();
+    std::vector<Particle> readParticles();
 
    private:
     void createBuffers(const std::vector<Particle>& initial);
-    void createForceCalcPipeline();
+    void createPipelines();
+    VkCommandBuffer beginCommands();
+    void submitAndWait(VkCommandBuffer cmd);
 
     VulkanContext* ctx_ = nullptr;
     SimParams params_{};
@@ -49,14 +57,19 @@ class Simulation {
     VkDeviceMemory particleMemory_ = VK_NULL_HANDLE;
     VkBuffer accelBuffer_ = VK_NULL_HANDLE;
     VkDeviceMemory accelMemory_ = VK_NULL_HANDLE;
+    VkBuffer readbackBuffer_ = VK_NULL_HANDLE;
+    VkDeviceMemory readbackMemory_ = VK_NULL_HANDLE;
+
     VkDeviceSize particleBytes_ = 0;
     VkDeviceSize accelBytes_ = 0;
+    VkDeviceSize accelReadbackOffset_ = 0;  // accel region start within readbackBuffer_
 
     VkDescriptorSetLayout setLayout_ = VK_NULL_HANDLE;
     VkDescriptorPool descriptorPool_ = VK_NULL_HANDLE;
     VkDescriptorSet descriptorSet_ = VK_NULL_HANDLE;
     VkPipelineLayout pipelineLayout_ = VK_NULL_HANDLE;
     VkPipeline forceCalcPipeline_ = VK_NULL_HANDLE;
+    VkPipeline integratePipeline_ = VK_NULL_HANDLE;
 
     VkCommandPool commandPool_ = VK_NULL_HANDLE;
 };
@@ -65,3 +78,6 @@ class Simulation {
 // same j = 0..N-1 iteration order as the shader.
 std::vector<Vec3> cpuForceCalc(const std::vector<Particle>& particles,
                                const SimParams& params);
+
+// Total linear momentum sum(m_i * v_i) of a particle set.
+Vec3 totalMomentum(const std::vector<Particle>& particles);

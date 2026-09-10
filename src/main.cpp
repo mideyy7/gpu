@@ -27,22 +27,21 @@ std::vector<Particle> makeParticles(uint32_t n, uint32_t seed) {
     return p;
 }
 
-// Relative error with an absolute floor, so near-zero components don't blow up.
+float length(const Vec3& v) { return std::sqrt(v.x * v.x + v.y * v.y + v.z * v.z); }
+Vec3 sub(const Vec3& a, const Vec3& b) { return {a.x - b.x, a.y - b.y, a.z - b.z}; }
+
 float relError(const Vec3& a, const Vec3& b) {
-    float num = std::sqrt((a.x - b.x) * (a.x - b.x) + (a.y - b.y) * (a.y - b.y) +
-                          (a.z - b.z) * (a.z - b.z));
-    float den = std::sqrt(b.x * b.x + b.y * b.y + b.z * b.z) + 1e-4f;
-    return num / den;
+    return length(sub(a, b)) / (length(b) + 1e-4f);
 }
 
-bool runCase(VulkanContext& ctx, uint32_t n, uint32_t seed, float tol) {
+// --- Phase 2: force-calc cross-check against CPU reference ---
+bool forceCalcCase(VulkanContext& ctx, uint32_t n, uint32_t seed, float tol) {
     SimParams params;
     params.particleCount = n;
     params.gravity = 1.0f;
     params.softening = 0.5f;
 
     auto particles = makeParticles(n, seed);
-
     Simulation sim;
     sim.init(ctx, params, particles);
     sim.runForceCalcOnce();
@@ -50,7 +49,6 @@ bool runCase(VulkanContext& ctx, uint32_t n, uint32_t seed, float tol) {
     sim.destroy();
 
     auto cpu = cpuForceCalc(particles, params);
-
     float worst = 0.0f;
     int worstIdx = -1;
     for (uint32_t i = 0; i < n; ++i) {
@@ -60,16 +58,46 @@ bool runCase(VulkanContext& ctx, uint32_t n, uint32_t seed, float tol) {
             worstIdx = static_cast<int>(i);
         }
     }
-
     bool ok = worst <= tol;
     std::printf("  N=%-5u seed=%-3u  worst rel-err=%.3e @ i=%d  [%s]\n", n, seed, worst,
                 worstIdx, ok ? "PASS" : "FAIL");
-    if (!ok && worstIdx >= 0) {
-        const auto& g = gpu[worstIdx];
-        const auto& c = cpu[worstIdx];
-        std::printf("    gpu=(% .6f % .6f % .6f)\n    cpu=(% .6f % .6f % .6f)\n", g.x, g.y,
-                    g.z, c.x, c.y, c.z);
+    return ok;
+}
+
+// --- Phase 3: momentum conservation over a multi-step run ---
+bool momentumCase(VulkanContext& ctx, uint32_t n, uint32_t seed, uint32_t steps, float tol) {
+    SimParams params;
+    params.particleCount = n;
+    params.gravity = 1.0f;
+    params.softening = 0.5f;
+    params.dt = 0.005f;
+
+    auto particles = makeParticles(n, seed);
+    const Vec3 p0 = totalMomentum(particles);
+    const float p0len = length(p0);
+
+    Simulation sim;
+    sim.init(ctx, params, particles);
+
+    float worstDrift = 0.0f;
+    uint32_t worstStep = 0;
+    for (uint32_t s = 1; s <= steps; ++s) {
+        sim.stepOnce();
+        auto state = sim.readParticles();
+        float drift = length(sub(totalMomentum(state), p0));
+        if (drift > worstDrift) {
+            worstDrift = drift;
+            worstStep = s;
+        }
     }
+    sim.destroy();
+
+    float relDrift = worstDrift / (p0len + 1e-4f);
+    bool ok = relDrift <= tol;
+    std::printf("  N=%-5u seed=%-3u steps=%u  |P0|=%.4f  worst drift=%.3e (rel %.3e) "
+                "@ step %u  [%s]\n",
+                n, seed, steps, p0len, worstDrift, relDrift, worstStep,
+                ok ? "PASS" : "FAIL");
     return ok;
 }
 
@@ -85,19 +113,25 @@ int main() {
     }
 
     std::printf("Device: %s\n", ctx.deviceSummary().c_str());
-    std::printf("Validation: %s\n\n", ctx.validationEnabled ? "enabled" : "disabled");
-    std::printf("Phase 2: force-calc GPU vs CPU reference\n");
-
-    const float tol = 2e-3f;  // GPU inversesqrt vs CPU 1/sqrt precision gap
-    struct Case {
-        uint32_t n, seed;
-    };
-    const Case cases[] = {{4, 1}, {8, 2}, {16, 3}, {13, 99}};
+    std::printf("Validation: %s\n", ctx.validationEnabled ? "enabled" : "disabled");
 
     int failures = 0;
     try {
-        for (const auto& c : cases)
-            if (!runCase(ctx, c.n, c.seed, tol)) ++failures;
+        std::printf("\nPhase 2: force-calc GPU vs CPU reference\n");
+        const float forceTol = 2e-3f;
+        const struct {
+            uint32_t n, seed;
+        } fcases[] = {{4, 1}, {8, 2}, {16, 3}, {13, 99}};
+        for (const auto& c : fcases)
+            if (!forceCalcCase(ctx, c.n, c.seed, forceTol)) ++failures;
+
+        std::printf("\nPhase 3: momentum conservation over multi-step run\n");
+        const float momTol = 5e-3f;
+        const struct {
+            uint32_t n, seed, steps;
+        } mcases[] = {{8, 7, 100}, {64, 11, 100}, {256, 42, 100}};
+        for (const auto& c : mcases)
+            if (!momentumCase(ctx, c.n, c.seed, c.steps, momTol)) ++failures;
     } catch (const std::exception& e) {
         std::fprintf(stderr, "fatal: %s\n", e.what());
         ctx.destroy();
@@ -105,8 +139,7 @@ int main() {
     }
 
     ctx.destroy();
-
-    std::printf("\n%s (%d/%zu cases failed)\n", failures == 0 ? "ALL PASS" : "FAILURES",
-                failures, sizeof(cases) / sizeof(cases[0]));
+    std::printf("\n%s (%d cases failed)\n", failures == 0 ? "ALL PASS" : "FAILURES",
+                failures);
     return failures == 0 ? EXIT_SUCCESS : EXIT_FAILURE;
 }
