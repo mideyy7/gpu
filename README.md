@@ -26,6 +26,22 @@ timestamp query pool is read back and converted to nanoseconds via
 these across many steps into a mean / min / p50 / p99 / max table with each
 stage's share of frame time.
 
+## Results at a glance (Apple M1 via MoltenVK)
+
+- Runs the N-body sim correctly up to **65,536 particles** (validation-clean),
+  stable per-step frame time to ~16k particles at ~15 ms/step.
+- Per-stage breakdown for **5 pipeline stages** (force dispatch, 2 barrier
+  stalls, integrate dispatch, readback copy) plus CPU submit + fence-wait,
+  reconciled to 100 % of GPU total.
+- Sweep across N = 256–32768 shows the force kernel is launch-overhead bound
+  below N ≈ 4096 and O(N²) compute-bound above N ≈ 8192.
+- **Bottleneck found and fixed with the profiler:** a fixed ~0.5 ms
+  per-step `vkQueueSubmit` + fence round-trip, removed by batching steps
+  per submit → **4.2× faster frame time at N = 2048** (1.87 ms → 0.45 ms
+  per step), result bit-identical. `docs/bottleneck.md`.
+- Instrumentation also shipped as a standalone `VK_LAYER_gcp_profiler` that
+  profiles any Vulkan app without recompiling it.
+
 ## Platform note — timings here are via MoltenVK
 
 This was built and measured on macOS / Apple Silicon (M1), where the only
@@ -253,3 +269,18 @@ plan.md          phase-by-phase build plan
   synchronisation model that this project surfaced.
 - `docs/bottleneck.md` — the per-step-submit bottleneck, its root cause, and
   the batching fix with before/after numbers.
+
+## Resume bullet
+
+> Built a headless Vulkan compute N-body simulation (up to 65,536 particles)
+> with custom per-stage GPU profiling via `vkCmdWriteTimestamp` queries;
+> used the tool's own breakdown to pin the dominant non-compute cost to a
+> fixed ~0.5 ms per-step `vkQueueSubmit` + fence round-trip, and removed it
+> by batching simulation steps into one command buffer per submit — **4.2×
+> faster frame time at N = 2048** (1.87 ms → 0.45 ms per step), verified
+> bit-identical. Also packaged the instrumentation as a standalone
+> `VK_LAYER` that profiles any Vulkan application unmodified.
+
+(Numbers measured on Apple M1 via MoltenVK; the translation layer inflates
+absolute submit/fence costs, so re-capture on a native Linux driver before
+quoting externally.)
